@@ -31,6 +31,8 @@
   <!-- Optional: Bullet if needed -->
   <depend>bullet</depend>
 
+  <test_depend>ament_cmake_gtest</test_depend>
+
   <!-- Export -->
   <export>
     <build_type>ament_cmake</build_type>

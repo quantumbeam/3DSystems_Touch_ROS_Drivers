@@ -34,6 +34,9 @@
 #include "touch_msgs/msg/touch_feedback.hpp"
 #include "touch_msgs/msg/touch_state.hpp"
 #include <pthread.h>
+#include <thread>
+
+#include "touch_common/force_watchdog.hpp"
 
 // Forward declarations
 HDCallbackCode HDCALLBACK touch_state_callback(void *pUserData);
@@ -52,7 +55,12 @@ struct TouchState {
   hduQuaternion rot;
   hduVector3Dd joints;
   hduVector3Dd force;   //3 element double vector force[0], force[1], force[2]
-  hduVector3Dd force_from_user; // Force received from the user topic
+  // force_feedback で受け取った力（N）。期限を過ぎたら haptic スレッドは 0 として扱う
+  touch_common::ForceFeedbackBuffer force_from_user;
+  int64_t force_timeout_ns;  // ns。これより古い受信の力は出さない
+  double max_force_n;        // N。Touch に出す合力の大きさの上限
+  // false にすると haptic スレッドは力を出さない（終了処理で使う）
+  std::atomic<bool> force_output_enabled{true};
   float thetas[7];
   int buttons[2];
   int buttons_prev[2];
@@ -90,6 +98,7 @@ public:
   
   // Publishing thread
   pthread_t publish_thread;
+  bool force_was_fresh = false;  // 前回の publish_touch_state で力が期限内だったか
   rclcpp::TimerBase::SharedPtr publish_timer;
 
   TouchROS(const rclcpp::NodeOptions & options = rclcpp::NodeOptions()) 
@@ -127,7 +136,25 @@ private:
     this->declare_parameter("robot_description_name", "robot_description");
     this->declare_parameter("robot_description", "");
 
+    // 送り側が落ちる・通信が切れると最後の力が残らないよう、この時間（ms）新しい力が届かなければ 0 にする。
+    // 100 ms は暫定（gello_ros の touch_timeout_ms と同じ値）。実機で調整していない
+    this->declare_parameter("force_timeout_ms", 100.0);
+    // Touch に出す合力の大きさの上限（N）。3.3 N は Touch の最大出力（データシート）
+    this->declare_parameter("max_force_n", 3.3);
+
     ref_frame = this->get_parameter("reference_frame").as_string();
+    const double force_timeout_ms = this->get_parameter("force_timeout_ms").as_double();
+    const double max_force_n = this->get_parameter("max_force_n").as_double();
+    if (!std::isfinite(force_timeout_ms) || force_timeout_ms <= 0.0) {
+      throw std::invalid_argument("force_timeout_ms must be a finite value > 0");
+    }
+    if (!std::isfinite(max_force_n) || max_force_n <= 0.0) {
+      throw std::invalid_argument("max_force_n must be a finite value > 0");
+    }
+    state->force_timeout_ns = static_cast<int64_t>(force_timeout_ms * 1e6);
+    state->max_force_n = max_force_n;
+    RCLCPP_INFO(this->get_logger(), "Force feedback: timeout [%.1f] ms, max [%.2f] N",
+                force_timeout_ms, max_force_n);
     units = this->get_parameter("units").as_string();
     robot_description_name = this->get_parameter("robot_description_name").as_string();
 
@@ -277,6 +304,11 @@ private:
     
     // Stop haptic device scheduler
     if (hHD != HD_INVALID_HANDLE) {
+      // 止める前に haptic スレッド（1 kHz）に力 0 を何周期か書かせる
+      if (state) {
+        state->force_output_enabled.store(false);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       hdStopScheduler();
       hdDisableDevice(hHD);
       RCLCPP_INFO(this->get_logger(), "Haptic device stopped and disabled.");
@@ -290,10 +322,8 @@ private:
    *******************************************************************************/
 public:
   void force_callback(const touch_msgs::msg::TouchFeedback::SharedPtr touchfeed) {
-    // Simply store the received force from the user. Damping will be applied in the haptic thread.
-    state->force_from_user[0] = std::isnan(touchfeed->force.x) ? 0.0 : touchfeed->force.x;
-    state->force_from_user[1] = std::isnan(touchfeed->force.y) ? 0.0 : touchfeed->force.y;
-    state->force_from_user[2] = std::isnan(touchfeed->force.z) ? 0.0 : touchfeed->force.z;
+    // 受け取った力と受信時刻を残す。期限・上限・damping は haptic スレッドで掛ける
+    state->force_from_user.store({touchfeed->force.x, touchfeed->force.y, touchfeed->force.z});
 
     // We still need to handle the lock position from the feedback message
     state->lock_pos[0] = std::isnan(touchfeed->position.x) ? 0.0 : touchfeed->position.x;
@@ -302,6 +332,18 @@ public:
   }
 
   void publish_touch_state() {
+    // 力の受信が途切れた・戻ったときに 1 回だけ知らせる（haptic スレッドからはログを出さない）
+    const bool force_fresh = state->force_from_user.fresh(state->force_timeout_ns);
+    if (force_fresh != force_was_fresh) {
+      if (force_fresh) {
+        RCLCPP_INFO(this->get_logger(), "Receiving force_feedback; applying it.");
+      } else {
+        RCLCPP_WARN(this->get_logger(),
+                    "No force_feedback for more than the timeout; the Touch force is zero.");
+      }
+      force_was_fresh = force_fresh;
+    }
+
     // Build the state msg
     touch_msgs::msg::TouchState state_msg;
     // Locked
@@ -521,10 +563,20 @@ HDCallbackCode HDCALLBACK touch_state_callback(void *pUserData)
   touch_state->out_vel2 = touch_state->out_vel1;
   touch_state->out_vel1 = touch_state->velocity;
 
-  // Apply damping to the user-provided force in the haptic thread
-  touch_state->force[0] = touch_state->force_from_user[0] - 0.001 * touch_state->velocity[0];
-  touch_state->force[1] = touch_state->force_from_user[1] - 0.001 * touch_state->velocity[1];
-  touch_state->force[2] = touch_state->force_from_user[2] - 0.001 * touch_state->velocity[2];
+  // 受信が期限を過ぎた力は 0 にしてから damping を足し、合力の大きさを上限以下にする。
+  // 終了処理中（force_output_enabled == false）は damping も含めて 0 にする
+  touch_common::Force3 force = {0.0, 0.0, 0.0};
+  if (touch_state->force_output_enabled.load()) {
+    const touch_common::Force3 user = touch_state->force_from_user.load(touch_state->force_timeout_ns);
+    force = touch_common::limit_force_norm(
+      {user[0] - 0.001 * touch_state->velocity[0],
+       user[1] - 0.001 * touch_state->velocity[1],
+       user[2] - 0.001 * touch_state->velocity[2]},
+      touch_state->max_force_n);
+  }
+  touch_state->force[0] = force[0];
+  touch_state->force[1] = force[1];
+  touch_state->force[2] = force[2];
 
   hduVector3Dd feedback;
   // Notice that we are changing Y <---> Z and inverting the Z-force_feedback
