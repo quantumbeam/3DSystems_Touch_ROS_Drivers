@@ -109,6 +109,16 @@ install(TARGETS touch_state
 )
 
 # ============================================================
-# 4. Package
+# 4. Tests
+# ============================================================
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  # OpenHaptics に依存しない部分（力の受信期限と上限）だけをテストする
+  ament_add_gtest(test_force_watchdog test/test_force_watchdog.cpp)
+  target_include_directories(test_force_watchdog PRIVATE include)
+endif()
+
+# ============================================================
+# 5. Package
 # ============================================================
 ament_package()

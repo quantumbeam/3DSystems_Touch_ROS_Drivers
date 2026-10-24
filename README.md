@@ -63,6 +63,22 @@ With RViz visualization launch is as follows:
 roslaunch touch_common touch.launch
 ```
 
+## Force feedback safety
+
+`/touch/force_feedback` (`touch_msgs/TouchFeedback`, force in N) is applied with two limits:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `force_timeout_ms` | `100.0` | If no new force arrives for this long (ms), the output force (including the damping term) becomes 0. Must be > 0 and <= 10000. Before this change the driver kept applying the last force forever, so a crashed or disconnected sender left the force on. Provisional value (same as gello_ros `touch_timeout_ms`), not tuned on the device. |
+| `max_force_n` | `3.3` | The magnitude of the total force (user force + damping) is limited to this value (N). Must be > 0 and <= 3.3 N, the Touch's maximum output (datasheet). |
+
+Both parameters are read only (read at startup; restart the node to change them). Non-finite components are treated as 0. The damping term (−0.001 × stylus velocity) is applied only while a fresh force is being received, so with no `force_feedback` publisher the stylus is free (previously the damping was always on). The force and its receipt time are handed to the haptic thread as one consistent snapshot (seqlock); a read that keeps overlapping an update yields 0, never a mix of two messages.
+On shutdown the node asks the haptic loop to output zero and waits up to 50 ms until it has completed 3 zero-force frames; it logs whether this was confirmed and then stops the scheduler either way.
+The publisher must therefore keep publishing (at least every `force_timeout_ms`) while it wants a force applied.
+
+Verification: unit tests (`colcon test --packages-select touch_common`), and a run with a stub OpenHaptics library
+(force drops to 0 about 100 ms after the sender stops; 10 N is limited to 3.3 N). Not yet verified on a real Touch.
+
 ## Acknowledgements and Citation
 This repository is forked from the [Geomagic_Touch_ROS_Drivers](https://github.com/bharatm11/Geomagic_Touch_ROS_Drivers) repository.
 The original repository by Francisco Suárez Ruiz, [http://fsuarez6.github.io](http://fsuarez6.github.io) for the Sensable PHANToM haptic device (https://github.com/fsuarez6/phantom_touch).
