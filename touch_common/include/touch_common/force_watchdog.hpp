@@ -12,11 +12,21 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 
 namespace touch_common
 {
 
 using Force3 = std::array<double, 3>;  // N
+
+// Touch が出せる力の大きさの上限（N、データシートの最大出力）。max_force_n はこれより大きくできない
+constexpr double kTouchMaxForceN = 3.3;
+
+// max_force_n（N）として受け付けるか（有限、0 より大きく kTouchMaxForceN 以下）
+inline bool valid_max_force_n(double max_force_n)
+{
+  return std::isfinite(max_force_n) && max_force_n > 0.0 && max_force_n <= kTouchMaxForceN;
+}
 
 // force_timeout_ms（ms）の上限。これより長い期限は、送り側が止まっても力が残る時間として長すぎる
 constexpr double kMaxForceTimeoutMs = 10000.0;
@@ -63,37 +73,43 @@ inline Force3 commanded_force(
     max_force_n);
 }
 
-// ROS のコールバック（書き手）と haptic スレッド（1 kHz の読み手）の間で力を受け渡す。
-// haptic スレッドを止めないよう lock を使わない。成分ごとの atomic なので、別々の受信の成分が
-// 混ざることはあるが、読み手は混ざった値にも大きさの上限を掛ける
+// ROS のコールバック（書き手）と haptic スレッド（1 kHz の読み手）の間で、力と受信時刻を 1 組として受け渡す。
+// haptic スレッドを止めないよう、読み手は lock を取らない（seqlock）。書き込みと重なった読み取りは
+// kMaxReadAttempts 回まで読み直し、それでも一貫した組が取れなければ 0 とする（別々の受信の成分を混ぜない）。
 class ForceFeedbackBuffer
 {
 public:
   using Clock = std::chrono::steady_clock;
+  static constexpr int kMaxReadAttempts = 3;
 
   void store(const Force3 & force, Clock::time_point received_at = Clock::now())
   {
+    std::lock_guard<std::mutex> lock(writer_mutex_);  // 書き手どうしだけを直列にする
+    const uint64_t seq = seq_.load(std::memory_order_relaxed);
+    seq_.store(seq + 1, std::memory_order_relaxed);  // 奇数: 書き込み中
+    std::atomic_thread_fence(std::memory_order_release);
     // 非有限の成分は 0 にする（以前の NaN の扱いと同じ。inf も 0 にする）
     for (size_t i = 0; i < 3; ++i) {
       force_[i].store(std::isfinite(force[i]) ? force[i] : 0.0, std::memory_order_relaxed);
     }
     received_ns_.store(
       std::chrono::duration_cast<std::chrono::nanoseconds>(received_at.time_since_epoch()).count(),
-      std::memory_order_release);
+      std::memory_order_relaxed);
+    seq_.store(seq + 2, std::memory_order_release);  // 偶数: 書き込み完了
   }
 
   // 期限内に受け取った力があれば true を返し、force にその力を入れる。なければ false と 0
   bool load(int64_t timeout_ns, Force3 & force, Clock::time_point now = Clock::now()) const
   {
     force = {0.0, 0.0, 0.0};
-    const int64_t received_ns = received_ns_.load(std::memory_order_acquire);
+    Force3 received;
+    int64_t received_ns = kNeverReceived;
+    if (!snapshot(received, received_ns)) {
+      return false;  // 書き込みと重なり続けた
+    }
     if (received_ns == kNeverReceived) {
       return false;  // 未受信（INT64_MIN を引き算しない）
     }
-    const Force3 received = {
-      force_[0].load(std::memory_order_relaxed),
-      force_[1].load(std::memory_order_relaxed),
-      force_[2].load(std::memory_order_relaxed)};
     const int64_t now_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
     // steady_clock の ns は単調で、受信時刻も同じ時計なので、この引き算はあふれない
@@ -113,7 +129,30 @@ public:
   }
 
 private:
+  // 1 回の store() で書かれた力と受信時刻の組を読む。取れなければ false
+  bool snapshot(Force3 & force, int64_t & received_ns) const
+  {
+    for (int attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
+      const uint64_t before = seq_.load(std::memory_order_acquire);
+      if (before & 1u) {
+        continue;  // 書き込み中
+      }
+      force = {
+        force_[0].load(std::memory_order_relaxed),
+        force_[1].load(std::memory_order_relaxed),
+        force_[2].load(std::memory_order_relaxed)};
+      received_ns = received_ns_.load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (seq_.load(std::memory_order_relaxed) == before) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static constexpr int64_t kNeverReceived = INT64_MIN;
+  std::mutex writer_mutex_;
+  std::atomic<uint64_t> seq_{0};
   std::array<std::atomic<double>, 3> force_{};
   std::atomic<int64_t> received_ns_{kNeverReceived};
 };

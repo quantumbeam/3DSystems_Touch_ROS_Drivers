@@ -61,6 +61,8 @@ struct TouchState {
   double max_force_n;        // N。Touch に出す合力の大きさの上限
   // false にすると haptic スレッドは力を出さない（終了処理で使う）
   std::atomic<bool> force_output_enabled{true};
+  // force_output_enabled == false のあと、力 0 を書いて hdEndFrame まで終えたフレームの数（終了処理の確認用）
+  std::atomic<uint64_t> zero_frames_written{0};
   float thetas[7];
   int buttons[2];
   int buttons_prev[2];
@@ -139,7 +141,7 @@ private:
     // 送り側が落ちる・通信が切れると最後の力が残らないよう、この時間（ms）新しい力が届かなければ 0 にする。
     // 100 ms は暫定（gello_ros の touch_timeout_ms と同じ値）。実機で調整していない
     this->declare_parameter("force_timeout_ms", 100.0);
-    // Touch に出す合力の大きさの上限（N）。3.3 N は Touch の最大出力（データシート）
+    // Touch に出す合力の大きさの上限（N）。3.3 N は Touch の最大出力（データシート）で、これより大きくはできない
     this->declare_parameter("max_force_n", 3.3);
 
     ref_frame = this->get_parameter("reference_frame").as_string();
@@ -148,8 +150,8 @@ private:
     if (!touch_common::valid_force_timeout_ms(force_timeout_ms)) {
       throw std::invalid_argument("force_timeout_ms must be > 0 and <= 10000 ms");
     }
-    if (!std::isfinite(max_force_n) || max_force_n <= 0.0) {
-      throw std::invalid_argument("max_force_n must be a finite value > 0");
+    if (!touch_common::valid_max_force_n(max_force_n)) {
+      throw std::invalid_argument("max_force_n must be > 0 and <= 3.3 N (Touch maximum output)");
     }
     state->force_timeout_ns = static_cast<int64_t>(force_timeout_ms * 1e6);
     state->max_force_n = max_force_n;
@@ -304,11 +306,27 @@ private:
     
     // Stop haptic device scheduler
     if (hHD != HD_INVALID_HANDLE) {
-      // 止める前に haptic スレッド（1 kHz）に力 0 を何周期か書かせる
+      // 止める前に haptic スレッド（1 kHz）に力 0 を書かせ、書き終えたフレームを数えて確かめる。
+      // 50 ms 待っても確かめられない（haptic コールバックが止まっている）ときも、そのまま装置を止める
       if (state) {
+        const uint64_t before = state->zero_frames_written.load();
         state->force_output_enabled.store(false);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (state->zero_frames_written.load() < before + 3 &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const uint64_t written = state->zero_frames_written.load() - before;
+        if (written >= 3) {
+          RCLCPP_INFO(this->get_logger(), "Wrote zero force for %lu haptic frames before stopping.",
+                      static_cast<unsigned long>(written));
+        } else {
+          RCLCPP_ERROR(this->get_logger(),
+                       "Could not confirm zero force before stopping (%lu frames written in 50 ms); "
+                       "stopping the scheduler and disabling the device anyway.",
+                       static_cast<unsigned long>(written));
+        }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       hdStopScheduler();
       hdDisableDevice(hHD);
       RCLCPP_INFO(this->get_logger(), "Haptic device stopped and disabled.");
@@ -591,8 +609,14 @@ HDCallbackCode HDCALLBACK touch_state_callback(void *pUserData)
 
   hdEndFrame(hdGetCurrentDevice());
 
-  HDErrorInfo error;
-  if (HD_DEVICE_ERROR(error = hdGetError())) {
+  // hdGetError() はエラーを取り出すので 1 回だけ呼ぶ
+  HDErrorInfo error = hdGetError();
+  const bool frame_ok = !HD_DEVICE_ERROR(error);
+  // 終了処理中に、力 0 を計算してこのフレームを書き終えたら数える（user_fresh は無効化後なら必ず false）
+  if (!user_fresh && !touch_state->force_output_enabled.load() && frame_ok) {
+    touch_state->zero_frames_written.fetch_add(1);
+  }
+  if (!frame_ok) {
     hduPrintError(stderr, &error, "Error during main scheduler callback");
     if (hduIsSchedulerError(&error))
       return HD_CALLBACK_DONE;

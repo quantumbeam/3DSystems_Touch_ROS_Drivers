@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <thread>
 
 #include "touch_common/force_watchdog.hpp"
 
@@ -11,6 +12,7 @@ using touch_common::Force3;
 using touch_common::ForceFeedbackBuffer;
 using touch_common::limit_force_norm;
 using touch_common::valid_force_timeout_ms;
+using touch_common::valid_max_force_n;
 using namespace std::chrono_literals;
 
 constexpr int64_t kTimeoutNs = 100'000'000;  // 100 ms
@@ -109,4 +111,44 @@ TEST(ForceFeedbackBuffer, NonFiniteComponentsAreZeroed)
   buffer.store({std::nan(""), std::numeric_limits<double>::infinity(), 0.3}, t0);
   EXPECT_TRUE(buffer.load(kTimeoutNs, force, t0));
   EXPECT_EQ(force, (Force3{0.0, 0.0, 0.3}));
+}
+
+TEST(ValidMaxForce, RejectsAboveTheDeviceMaximum)
+{
+  EXPECT_TRUE(valid_max_force_n(3.3));
+  EXPECT_TRUE(valid_max_force_n(1.0));
+  EXPECT_FALSE(valid_max_force_n(3.31));
+  EXPECT_FALSE(valid_max_force_n(100.0));
+  EXPECT_FALSE(valid_max_force_n(0.0));
+  EXPECT_FALSE(valid_max_force_n(std::nan("")));
+}
+
+TEST(ForceFeedbackBuffer, NeverMixesComponentsOfDifferentMessages)
+{
+  // 書き手が {3,0,0} と {0,3,0} を交互に書く間、読み手はどちらか（または 0）しか見ない
+  ForceFeedbackBuffer buffer;
+  std::atomic<bool> stop{false};
+  std::thread writer([&] {
+    for (int i = 0; !stop.load(); ++i) {
+      buffer.store(i % 2 ? Force3{3.0, 0.0, 0.0} : Force3{0.0, 3.0, 0.0});
+    }
+  });
+  int mixed = 0;
+  int read = 0;
+  const auto end = std::chrono::steady_clock::now() + 300ms;
+  while (std::chrono::steady_clock::now() < end) {
+    Force3 force;
+    if (buffer.load(kTimeoutNs, force)) {
+      ++read;
+      const bool x = force == Force3{3.0, 0.0, 0.0};
+      const bool y = force == Force3{0.0, 3.0, 0.0};
+      if (!x && !y) {
+        ++mixed;
+      }
+    }
+  }
+  stop = true;
+  writer.join();
+  EXPECT_GT(read, 0);
+  EXPECT_EQ(mixed, 0);
 }
