@@ -145,8 +145,8 @@ private:
     ref_frame = this->get_parameter("reference_frame").as_string();
     const double force_timeout_ms = this->get_parameter("force_timeout_ms").as_double();
     const double max_force_n = this->get_parameter("max_force_n").as_double();
-    if (!std::isfinite(force_timeout_ms) || force_timeout_ms <= 0.0) {
-      throw std::invalid_argument("force_timeout_ms must be a finite value > 0");
+    if (!touch_common::valid_force_timeout_ms(force_timeout_ms)) {
+      throw std::invalid_argument("force_timeout_ms must be > 0 and <= 10000 ms");
     }
     if (!std::isfinite(max_force_n) || max_force_n <= 0.0) {
       throw std::invalid_argument("max_force_n must be a finite value > 0");
@@ -563,17 +563,15 @@ HDCallbackCode HDCALLBACK touch_state_callback(void *pUserData)
   touch_state->out_vel2 = touch_state->out_vel1;
   touch_state->out_vel1 = touch_state->velocity;
 
-  // 受信が期限を過ぎた力は 0 にしてから damping を足し、合力の大きさを上限以下にする。
-  // 終了処理中（force_output_enabled == false）は damping も含めて 0 にする
-  touch_common::Force3 force = {0.0, 0.0, 0.0};
-  if (touch_state->force_output_enabled.load()) {
-    const touch_common::Force3 user = touch_state->force_from_user.load(touch_state->force_timeout_ns);
-    force = touch_common::limit_force_norm(
-      {user[0] - 0.001 * touch_state->velocity[0],
-       user[1] - 0.001 * touch_state->velocity[1],
-       user[2] - 0.001 * touch_state->velocity[2]},
-      touch_state->max_force_n);
-  }
+  // 期限内に受け取った力があるときだけ、damping を足して合力の大きさを上限以下にして出す。
+  // 受信が期限を過ぎた・未受信・終了処理中（force_output_enabled == false）は、damping も含めて 0
+  touch_common::Force3 user = {0.0, 0.0, 0.0};
+  const bool user_fresh = touch_state->force_output_enabled.load() &&
+    touch_state->force_from_user.load(touch_state->force_timeout_ns, user);
+  const touch_common::Force3 force = touch_common::commanded_force(
+    user, user_fresh,
+    {touch_state->velocity[0], touch_state->velocity[1], touch_state->velocity[2]},
+    0.001, touch_state->max_force_n);
   touch_state->force[0] = force[0];
   touch_state->force[1] = force[1];
   touch_state->force[2] = force[2];

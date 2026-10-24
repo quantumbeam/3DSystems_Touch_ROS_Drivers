@@ -18,6 +18,15 @@ namespace touch_common
 
 using Force3 = std::array<double, 3>;  // N
 
+// force_timeout_ms（ms）の上限。これより長い期限は、送り側が止まっても力が残る時間として長すぎる
+constexpr double kMaxForceTimeoutMs = 10000.0;
+
+// force_timeout_ms として受け付けるか（有限、0 より大きく kMaxForceTimeoutMs 以下）
+inline bool valid_force_timeout_ms(double timeout_ms)
+{
+  return std::isfinite(timeout_ms) && timeout_ms > 0.0 && timeout_ms <= kMaxForceTimeoutMs;
+}
+
 inline bool is_finite(const Force3 & force)
 {
   return std::isfinite(force[0]) && std::isfinite(force[1]) && std::isfinite(force[2]);
@@ -37,15 +46,21 @@ inline Force3 limit_force_norm(const Force3 & force, double max_force_n)
   return {force[0] * scale, force[1] * scale, force[2] * scale};
 }
 
-// 受け取った力を、受信からの経過（ns）で 0 にするかを決めて返す。
-// 一度も受け取っていない（received == false）、経過が負（時計の不整合）、期限を過ぎたものは 0
-inline Force3 force_within_deadline(
-  const Force3 & received_force, bool received, int64_t age_ns, int64_t timeout_ns)
+// Touch に出す力（N）。期限内に受け取った力（user_force_fresh）があるときだけ、受け取った力に damping
+// （−damping × 速度）を足し、合力の大きさを max_force_n 以下にする。期限切れ・未受信なら damping も含めて 0
+// （送り側が止まったら、Touch は力を出さない）
+inline Force3 commanded_force(
+  const Force3 & user_force, bool user_force_fresh, const Force3 & velocity, double damping,
+  double max_force_n)
 {
-  if (!received || age_ns < 0 || age_ns > timeout_ns || !is_finite(received_force)) {
+  if (!user_force_fresh) {
     return {0.0, 0.0, 0.0};
   }
-  return received_force;
+  return limit_force_norm(
+    {user_force[0] - damping * velocity[0],
+     user_force[1] - damping * velocity[1],
+     user_force[2] - damping * velocity[2]},
+    max_force_n);
 }
 
 // ROS のコールバック（書き手）と haptic スレッド（1 kHz の読み手）の間で力を受け渡す。
@@ -67,27 +82,34 @@ public:
       std::memory_order_release);
   }
 
-  // 期限内なら受け取った力、そうでなければ 0
-  Force3 load(int64_t timeout_ns, Clock::time_point now = Clock::now()) const
+  // 期限内に受け取った力があれば true を返し、force にその力を入れる。なければ false と 0
+  bool load(int64_t timeout_ns, Force3 & force, Clock::time_point now = Clock::now()) const
   {
+    force = {0.0, 0.0, 0.0};
     const int64_t received_ns = received_ns_.load(std::memory_order_acquire);
-    const Force3 force = {
+    if (received_ns == kNeverReceived) {
+      return false;  // 未受信（INT64_MIN を引き算しない）
+    }
+    const Force3 received = {
       force_[0].load(std::memory_order_relaxed),
       force_[1].load(std::memory_order_relaxed),
       force_[2].load(std::memory_order_relaxed)};
     const int64_t now_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    return force_within_deadline(force, received_ns != kNeverReceived, now_ns - received_ns, timeout_ns);
+    // steady_clock の ns は単調で、受信時刻も同じ時計なので、この引き算はあふれない
+    const int64_t age_ns = now_ns - received_ns;
+    if (age_ns < 0 || age_ns > timeout_ns || !is_finite(received)) {
+      return false;
+    }
+    force = received;
+    return true;
   }
 
   // 期限内に受け取った力があるか（ログ用）
   bool fresh(int64_t timeout_ns, Clock::time_point now = Clock::now()) const
   {
-    const int64_t received_ns = received_ns_.load(std::memory_order_acquire);
-    const int64_t now_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    return received_ns != kNeverReceived && now_ns - received_ns >= 0 &&
-           now_ns - received_ns <= timeout_ns;
+    Force3 unused;
+    return load(timeout_ns, unused, now);
   }
 
 private:
