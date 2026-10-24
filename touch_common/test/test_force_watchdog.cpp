@@ -152,3 +152,37 @@ TEST(ForceFeedbackBuffer, NeverMixesComponentsOfDifferentMessages)
   EXPECT_GT(read, 0);
   EXPECT_EQ(mixed, 0);
 }
+
+TEST(ShutdownZeroFrames, CountsOnlyCompletedZeroFramesAfterDisabling)
+{
+  using touch_common::counts_as_zero_frame;
+  EXPECT_TRUE(counts_as_zero_frame(false, false, true));
+  EXPECT_FALSE(counts_as_zero_frame(false, false, false));  // フレームがエラーで終わった
+  EXPECT_FALSE(counts_as_zero_frame(true, false, true));    // 無効化前に計算した力を出したフレーム
+  EXPECT_FALSE(counts_as_zero_frame(false, true, true));    // まだ出力中（受信が途切れていただけ）
+}
+
+TEST(ShutdownZeroFrames, ConfirmedWhenTheHapticLoopRuns)
+{
+  std::atomic<uint64_t> frames{5};
+  std::atomic<bool> stop{false};
+  std::thread haptic([&] {
+    while (!stop.load()) {
+      frames.fetch_add(1);
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  EXPECT_TRUE(touch_common::wait_for_zero_frames(frames, 5, 3, 50ms));
+  stop = true;
+  haptic.join();
+}
+
+TEST(ShutdownZeroFrames, GivesUpWhenTheHapticLoopHasStopped)
+{
+  std::atomic<uint64_t> frames{5};
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(touch_common::wait_for_zero_frames(frames, 5, 3, 50ms));
+  const auto waited = std::chrono::steady_clock::now() - start;
+  EXPECT_GE(waited, 50ms);
+  EXPECT_LT(waited, 200ms);
+}

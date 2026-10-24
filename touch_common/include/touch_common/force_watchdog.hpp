@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 
 namespace touch_common
 {
@@ -156,6 +157,29 @@ private:
   std::array<std::atomic<double>, 3> force_{};
   std::atomic<int64_t> received_ns_{kNeverReceived};
 };
+
+// 終了処理で、このフレームを「力 0 を書き終えたフレーム」として数えるか。
+// 出力を止めたあと（output_enabled == false）に力 0 を計算し（user_force_fresh == false）、
+// フレームがエラーなく終わったものだけを数える
+inline bool counts_as_zero_frame(bool user_force_fresh, bool output_enabled, bool frame_ok)
+{
+  return !user_force_fresh && !output_enabled && frame_ok;
+}
+
+// zero_frames が before + needed に届くまで、最大 timeout 待つ。届いたら true
+inline bool wait_for_zero_frames(
+  const std::atomic<uint64_t> & zero_frames, uint64_t before, uint64_t needed,
+  std::chrono::milliseconds timeout)
+{
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (zero_frames.load() < before + needed) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
 
 }  // namespace touch_common
 

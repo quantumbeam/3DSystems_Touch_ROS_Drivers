@@ -140,9 +140,12 @@ private:
 
     // 送り側が落ちる・通信が切れると最後の力が残らないよう、この時間（ms）新しい力が届かなければ 0 にする。
     // 100 ms は暫定（gello_ros の touch_timeout_ms と同じ値）。実機で調整していない
-    this->declare_parameter("force_timeout_ms", 100.0);
+    // 2 つとも起動時にだけ読む（実行中に変えても反映されないので、read_only にして変更を拒否する）
+    rcl_interfaces::msg::ParameterDescriptor read_only;
+    read_only.read_only = true;
+    this->declare_parameter("force_timeout_ms", 100.0, read_only);
     // Touch に出す合力の大きさの上限（N）。3.3 N は Touch の最大出力（データシート）で、これより大きくはできない
-    this->declare_parameter("max_force_n", 3.3);
+    this->declare_parameter("max_force_n", 3.3, read_only);
 
     ref_frame = this->get_parameter("reference_frame").as_string();
     const double force_timeout_ms = this->get_parameter("force_timeout_ms").as_double();
@@ -311,13 +314,10 @@ private:
       if (state) {
         const uint64_t before = state->zero_frames_written.load();
         state->force_output_enabled.store(false);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-        while (state->zero_frames_written.load() < before + 3 &&
-               std::chrono::steady_clock::now() < deadline) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        const bool confirmed = touch_common::wait_for_zero_frames(
+          state->zero_frames_written, before, 3, std::chrono::milliseconds(50));
         const uint64_t written = state->zero_frames_written.load() - before;
-        if (written >= 3) {
+        if (confirmed) {
           RCLCPP_INFO(this->get_logger(), "Wrote zero force for %lu haptic frames before stopping.",
                       static_cast<unsigned long>(written));
         } else {
@@ -613,7 +613,8 @@ HDCallbackCode HDCALLBACK touch_state_callback(void *pUserData)
   HDErrorInfo error = hdGetError();
   const bool frame_ok = !HD_DEVICE_ERROR(error);
   // 終了処理中に、力 0 を計算してこのフレームを書き終えたら数える（user_fresh は無効化後なら必ず false）
-  if (!user_fresh && !touch_state->force_output_enabled.load() && frame_ok) {
+  if (touch_common::counts_as_zero_frame(
+      user_fresh, touch_state->force_output_enabled.load(), frame_ok)) {
     touch_state->zero_frames_written.fetch_add(1);
   }
   if (!frame_ok) {
